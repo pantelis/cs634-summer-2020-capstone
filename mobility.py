@@ -1,7 +1,7 @@
 import pandas as pd
 import numpy as np
 
-train_df = pd.read_csv('../training_data.csv', encoding="ISO-8859-1")
+train_df = pd.read_csv('training_data.csv', encoding="ISO-8859-1")
 matrix = train_df.groupby(['pickup_grid_number','dropoff_grid_number']).size().unstack().fillna(0)
 
 matrixByHours = train_df.groupby(['hour','pickup_grid_number','dropoff_grid_number']).size().unstack().fillna(0)
