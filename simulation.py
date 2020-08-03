@@ -2,24 +2,64 @@ from mesa import Agent, Model
 from mesa.time import RandomActivation
 from mesa.space import MultiGrid
 from mesa.datacollection import DataCollector
-from epidemiology import fetch_grid_health_df, fetch_risk_df
-from mobility import fetch_total_population_df
-from controller import ride_request
+from constants import SIMULATION_COUNT
+from constants import AGENT_COUNT
+from epidemiology import Epidemiology
+from controller import Controller
 import pandas as pd
 import numpy as np
 import random
 import matplotlib.pyplot as plt
 
-SAFETY_THRESHOLD = 0.95
+simulation_df = pd.read_csv('simulation.csv', encoding="ISO-8859-1")
 
-def compute_infection(model):
-    agent_healths = [agent.health for agent in model.schedule.agents]
-    infected_count = agent_healths.count(1) + agent_healths.count(2)
-    print('infected_count:', infected_count)
-    return infected_count
+class Simulation:
 
-class RiderAgent(Agent):
-    
+    def __init__(self):
+        headers = {'iteration': [], 'threshold': [], 'before_count': [], 'after_count': [], 'difference': []}
+        self.results_file = 'results.csv'
+        self.generate_csv_results_file(headers, self.results_file)
+        for threshold in np.linspace(0.5, 1, 10):
+            self.epidemiology = Epidemiology(threshold)
+            self.controller = Controller(self.epidemiology.grid_health_df)
+            self.simulation_df = simulation_df
+            self.completed = False
+            self.before_count = 0
+            self.after_count = 0
+            for i in range(SIMULATION_COUNT):
+                self.model = RiderModel(AGENT_COUNT, 25, 100, self, self.epidemiology, self.controller)
+                self.model.step()
+                self.record_results(i, threshold)
+
+    def record_results(self, iteration, threshold):
+        data = {
+            'iteration': [iteration],
+            'threshold': [threshold],
+            'before_count': [self.before_count],
+            'after_count': [self.after_count],
+            'difference': [self.after_count - self.before_count]
+        }
+        self.append_to_results_file(data, self.results_file)
+
+    def append_to_results_file(self, data, filename):
+        df = pd.DataFrame(data=data)
+        df.to_csv(filename, mode='a', header=False, index=False)
+
+    def generate_csv_results_file(self, data, filename):
+        df = pd.DataFrame(data=data)
+        df.to_csv(filename, index=False)
+
+    def compute_infection(self, model):
+        agent_healths = [agent.health for agent in self.model.schedule.agents]
+        infected_count = agent_healths.count(1) + agent_healths.count(2)
+        if self.completed == True:
+            self.after_count = infected_count
+        else:
+            self.before_count = infected_count
+        return infected_count
+
+class RiderAgent(Agent, Simulation):
+        
     def __init__(self, model, unique_id, health, hour, origin, destination):
         super().__init__(unique_id, model)
         self.destination = destination
@@ -32,10 +72,13 @@ class RiderAgent(Agent):
         return self.health
 
     def getGridHealthState(self):
-        return grid_health_df[str(self.destination)][self.hour]
+        try:
+            return self.model.epidemiology.grid_health_df[str(self.destination)][self.hour]
+        except KeyError:
+            return 'safe'
 
     def getRideApproval(self):
-        return_code = ride_request(self.hour, self.health, self.origin, self.destination)
+        return_code = self.model.controller.ride_request(self.hour, self.health, self.origin, self.destination)
         if return_code > 0:
             self.hour = return_code
             return 0
@@ -44,7 +87,7 @@ class RiderAgent(Agent):
         return return_code
 
     def healthStatusUpdate(self):
-        covid_probability = risk_df[str(self.destination)][self.hour]
+        covid_probability = self.model.epidemiology.risk_df[str(self.destination)][self.hour]
         for i in range(random.randint(2, 6)):
             simulation = random.random()
             if simulation < covid_probability:
@@ -54,7 +97,7 @@ class RiderAgent(Agent):
         self.healthState = self.getRiderHealthState()
         self.gridHealthState = self.getGridHealthState()
         self.rideApproved = self.getRideApproval()
-        
+            
         if self.rideApproved == 0:
             x = self.destination % 25
             y = self.destination // 25 + 1
@@ -62,19 +105,22 @@ class RiderAgent(Agent):
             self.model.grid.move_agent(self, newPos)
         self.health = self.getRiderHealthState()
 
-class RiderModel(Model):
+class RiderModel(Model, Simulation):
     """A model with some number of agents."""
-    def __init__(self, N, width, height):
+    def __init__(self, N, width, height, simulation, epidemiology, controller):
         self.num_agents = N
         self.grid = MultiGrid(width, height, True)
         self.schedule = RandomActivation(self)
+        self.simulation = simulation
+        self.controller = controller
+        self.epidemiology = epidemiology
         # Create agents
         for i in range(self.num_agents):
             rider_id = random.randint(0, 4000000)
-            hour = simulation_df[simulation_df['user_id'] == rider_id].hour.values[0].astype('int')
-            origin = simulation_df[simulation_df['user_id'] == rider_id].pickup_grid_number.values[0].astype('int')
-            destination = simulation_df[simulation_df['user_id'] == rider_id].dropoff_grid_number.values[0].astype('int')
-            health = simulation_df[simulation_df['user_id'] == rider_id].state.values[0].astype('int')
+            hour = self.simulation.simulation_df[self.simulation.simulation_df['user_id'] == rider_id].hour.values[0].astype('int')
+            origin = self.simulation.simulation_df[self.simulation.simulation_df['user_id'] == rider_id].pickup_grid_number.values[0].astype('int')
+            destination = self.simulation.simulation_df[self.simulation.simulation_df['user_id'] == rider_id].dropoff_grid_number.values[0].astype('int')
+            health = self.simulation.simulation_df[self.simulation.simulation_df['user_id'] == rider_id].state.values[0].astype('int')
             agent = RiderAgent(self, rider_id, health, hour, origin, destination)
             self.schedule.add(agent)
 
@@ -83,33 +129,30 @@ class RiderModel(Model):
             self.grid.place_agent(agent, (x, y))
 
         self.datacollector = DataCollector(
-            model_reporters={"Infection": compute_infection},
+            model_reporters={"Infection": self.simulation.compute_infection},
             agent_reporters={"Health": "health"}
         )
 
     def step(self):
+        self.simulation.completed = False
         self.datacollector.collect(self)
         self.schedule.step()
-        self.datacollector.collect(self)
+        self.simulation.completed = True
+        self.datacollector.collect(self) 
 
-simulation_df = pd.read_csv('simulation.csv', encoding="ISO-8859-1")
-population_df = fetch_total_population_df()
-grid_health_df = fetch_grid_health_df(SAFETY_THRESHOLD)
-risk_df = fetch_risk_df()
-model = RiderModel(1000, 25, 100)
-model.step()
+simulation = Simulation()
 
-agent_counts = np.zeros((model.grid.width, model.grid.height))
-for cell in model.grid.coord_iter():
-    cell_content, x, y = cell
-    agent_count = len(cell_content)
-    agent_counts[x][y] = agent_count
-plt.imshow(agent_counts, interpolation='nearest')
-plt.colorbar()
-plt.show()
+# agent_counts = np.zeros((model.grid.width, model.grid.height))
+# for cell in model.grid.coord_iter():
+#     cell_content, x, y = cell
+#     agent_count = len(cell_content)
+#     agent_counts[x][y] = agent_count
+# plt.imshow(agent_counts, interpolation='nearest')
+# plt.colorbar()
+# plt.show()
 
-agent_health = model.datacollector.get_agent_vars_dataframe()
-agent_health.head()
+# agent_health = model.datacollector.get_agent_vars_dataframe()
+# agent_health.head()
 
-infection = model.datacollector.get_model_vars_dataframe()
-infection.plot()
+# infection = model.datacollector.get_model_vars_dataframe()
+# infection.plot()
